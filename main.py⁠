@@ -1,0 +1,187 @@
+# ==============================================================================
+# Google Colab 整合專案：半導體冰水機水溫預測與智慧節能 AI 模型 (嚴謹修正版)
+# ==============================================================================
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import matplotlib.pyplot as plt
+import joblib
+
+# 設定隨機種子以確保結果可複現
+np.random.seed(42)
+torch.manual_seed(42)
+
+# ------------------------------------------------------------------------------
+# 步驟 1：升級版物理模型（加入系統熱慣性與冷卻調節）
+# ------------------------------------------------------------------------------
+print("🌐 [1/5] 建立半導體機台與具備熱慣性之動態冰水機系統...")
+n_samples = 86400  # 模擬 24 小時資料 (1秒/筆)
+timestamps = pd.date_range(start="2026-10-26 00:00:00", periods=n_samples, freq="1s")
+
+# 模擬機台電氣功率 (W)
+rf_power = np.random.choice([0, 500, 1200, 2000], size=n_samples, p=[0.4, 0.3, 0.2, 0.1])
+laser_power = np.random.choice([0, 300, 800], size=n_samples, p=[0.5, 0.3, 0.2])
+
+# 熱負載計算 (換算為熱功率 W)
+heat_load = 0.8 * rf_power + 0.9 * laser_power + np.random.normal(0, 50, n_samples)
+ambient_temp = 23.0 + 2.0 * np.sin(np.linspace(0, 2 * np.pi, n_samples))
+
+# 動態熱慣性物理模擬 (Consider Cooling Inertia & PID regulation)
+water_temp = np.zeros(n_samples)
+water_temp[0] = 20.0  # 初始設定點 20.0 °C
+c_water = 4184.0      # 水的比熱 J/(kg·°C)
+m_water = 50.0        # 循環水質量 kg
+
+for t in range(1, n_samples):
+    # 冰水主機根據當前溫差調整冷卻功率 (W)
+    cooling_power = 0.85 * heat_load[t-1] + 150.0 * (water_temp[t-1] - 20.0)
+    net_heat = heat_load[t-1] - cooling_power
+    
+    # 溫度動態微分變化
+    delta_temp = (net_heat / (m_water * c_water)) + np.random.normal(0, 0.002)
+    water_temp[t] = water_temp[t-1] + delta_temp
+
+df = pd.DataFrame({
+    'timestamp': timestamps,
+    'rf_power': rf_power,
+    'laser_power': laser_power,
+    'heat_load': heat_load,
+    'ambient_temp': ambient_temp,
+    'water_temp': water_temp
+})
+
+# ------------------------------------------------------------------------------
+# 步驟 2：資料預處理 (嚴格修正：先切分訓練集，避免資料洩漏)
+# ------------------------------------------------------------------------------
+print("⚙️ [2/5] 資料預處理與切分 (嚴格防止 Data Leakage)...")
+
+# 1. 依時間序列切分 (80% 訓練, 20% 測試)
+split_idx = int(len(df) * 0.8)
+train_df = df.iloc[:split_idx]
+test_df = df.iloc[split_idx:]
+
+features = ['rf_power', 'laser_power', 'heat_load', 'ambient_temp', 'water_temp']
+
+# 2. 僅使用訓練集 Fit 擬合標準化器 (防止資料洩漏)
+scaler = MinMaxScaler()
+scaler.fit(train_df[features])
+
+# 3. 再對整體資料進行 Transform 轉換
+scaled_data = scaler.transform(df[features])
+
+def create_sequences(data, seq_length=10):
+    X, y = [], []
+    for i in range(len(data) - seq_length):
+        X.append(data[i:i + seq_length])
+        y.append(data[i + seq_length, -1])  # 預測目標：water_temp
+    return np.array(X), np.array(y)
+
+seq_length = 10
+X, y = create_sequences(scaled_data, seq_length)
+
+# 重新計算滑動視窗後的切分點
+train_seq_size = split_idx - seq_length
+X_train, X_test = torch.FloatTensor(X[:train_seq_size]), torch.FloatTensor(X[train_seq_size:])
+y_train, y_test = torch.FloatTensor(y[:train_seq_size]), torch.FloatTensor(y[train_seq_size:])
+
+train_dataset = TensorDataset(X_train, y_train)
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+
+# ------------------------------------------------------------------------------
+# 步驟 3：建立與訓練 LSTM AI 模型
+# ------------------------------------------------------------------------------
+print("🧠 [3/5] 訓練 LSTM 水溫預測模型中...")
+
+class ChillerLSTM(nn.Module):
+    def __init__(self, input_size=5, hidden_size=64, num_layers=2):
+        super(ChillerLSTM, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, 1)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return self.fc(out[:, -1, :])
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = ChillerLSTM().to(device)
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+epochs = 5
+model.train()
+for epoch in range(epochs):
+    total_loss = 0
+    for batch_X, batch_y in train_loader:
+        batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+        optimizer.zero_grad()
+        output = model(batch_X).squeeze()
+        loss = criterion(output, batch_y)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    print(f"   Epoch [{epoch+1}/{epochs}], Loss: {total_loss/len(train_loader):.6f}")
+
+# ------------------------------------------------------------------------------
+# 步驟 4：模型評估與基準 (Naive Baseline) 對比
+# ------------------------------------------------------------------------------
+print("📈 [4/5] 進行模型評估與與持續性預測基準 (Persistence Baseline) 對比...")
+
+model.eval()
+with torch.no_grad():
+    predictions = model(X_test.to(device)).cpu().numpy()
+
+# 反標準化還原為真實攝氏溫度 (°C)
+def inverse_temp(scaled_y):
+    dummy = np.zeros((len(scaled_y), 5))
+    dummy[:, -1] = scaled_y.flatten()
+    return scaler.inverse_transform(dummy)[:, -1]
+
+real_preds = inverse_temp(predictions)
+real_y = inverse_temp(y_test.numpy())
+
+# 計算持續性預測基準 (Naive Persistence Baseline: 用上一個時刻的溫度當作下一個時刻的預測值)
+naive_preds_scaled = X_test[:, -1, -1].numpy()  # 滑動視窗最後一個時間點的水溫
+real_naive_preds = inverse_temp(naive_preds_scaled)
+
+# 算量化指標
+lstm_mae = mean_absolute_error(real_y, real_preds)
+lstm_rmse = np.sqrt(mean_squared_error(real_y, real_preds))
+lstm_r2 = r2_score(real_y, real_preds)
+
+naive_mae = mean_absolute_error(real_y, real_naive_preds)
+naive_rmse = np.sqrt(mean_squared_error(real_y, real_naive_preds))
+
+print("\n📊 --- 專案客觀指標與基準對比驗證 ---")
+print(f"1. Naive 基準模型 (持續性預測)  -> MAE: {naive_mae:.5f} °C, RMSE: {naive_rmse:.5f} °C")
+print(f"2. 本專案 LSTM AI 預測模型    -> MAE: {lstm_mae:.5f} °C, RMSE: {lstm_rmse:.5f} °C")
+print(f"3. R² 決定係數                -> {lstm_r2:.4f}")
+
+if lstm_mae < naive_mae:
+    improvement = ((naive_mae - lstm_mae) / naive_mae) * 100
+    print(f"✅ 驗證成功：LSTM 模型顯著優於 Naive 基準，預測誤差降低了 {improvement:.2f}%！")
+
+# ------------------------------------------------------------------------------
+# 步驟 5：繪製時序對比圖與儲存
+# ------------------------------------------------------------------------------
+print("\n🎨 [5/5] 繪製預測趨勢對比圖並導出檔案...")
+
+plt.figure(figsize=(10, 4))
+plt.plot(real_y[:200], label="Actual Water Temp (°C)", color="#1f77b4", linewidth=1.5)
+plt.plot(real_preds[:200], label="LSTM Predicted Temp (°C)", color="#d62728", linestyle="--", linewidth=1.5)
+plt.plot(real_naive_preds[:200], label="Naive Baseline (°C)", color="#7f7f7f", linestyle=":", alpha=0.6)
+plt.title("Chiller Water Temperature Prediction vs Naive Baseline")
+plt.xlabel("Time Index (s)")
+plt.ylabel("Temperature (°C)")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.show()
+
+# 保存檔案
+torch.save(model.cpu().state_dict(), "chiller_model.pth")
+joblib.dump(scaler, "scaler.pkl")
+print("💾 已生成合規且嚴謹的模型檔 chiller_model.pth 與 scaler.pkl！")
