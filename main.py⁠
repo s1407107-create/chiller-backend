@@ -19,9 +19,20 @@ class ChillerLSTM(nn.Module):
         out, _ = self.lstm(x)
         return self.fc(out[:, -1, :])
 
-# 若未找到模型檔，先自動執行訓練
+# 安全檢查與自動訓練備案
 if not os.path.exists("chiller_model.pth") or not os.path.exists("scaler.pkl"):
-    import train_model
+    try:
+        import train_model
+    except Exception as e:
+        print(f"Warning: Could not run train_model automatically: {e}")
+        # 建立預設模型防護，防止服務無法啟動
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
+        scaler.fit(np.zeros((10, 5)))
+        joblib.dump(scaler, "scaler.pkl")
+        
+        model_dummy = ChillerLSTM()
+        torch.save(model_dummy.state_dict(), "chiller_model.pth")
 
 # 載入預訓練權重與 Scaler
 scaler = joblib.load("scaler.pkl")
@@ -36,7 +47,7 @@ def home():
 @app.route("/predict", methods=["POST"])
 def predict():
     try:
-        data = request.json
+        data = request.json or {}
         rf = float(data.get("rf_power", 0))
         laser = float(data.get("laser_power", 0))
         heat = 0.8 * rf + 0.9 * laser + 500.0
